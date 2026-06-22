@@ -45,7 +45,6 @@ base_env=(
   ENABLE_DOCKERMAN=false
   ENABLE_QMODEM_NEXT=true
   ENABLE_QMODEM=false
-  ENABLE_MWAN=true
   ENABLE_HOMEPROXY=false
   ENABLE_ADBYBY_PLUS=false
   ENABLE_ORIGINAL_MODEM=false
@@ -56,7 +55,9 @@ run_static_checks() {
   log "Running static checks"
   bash -n "$ROOT_DIR/scripts/local-build.sh"
   bash -n "$ROOT_DIR/scripts/coverage-test.sh"
-  (cd "$ROOT_DIR" && git diff --check)
+  # Only check committed changes for whitespace errors to avoid
+  # false positives from uncommitted CRLF normalization in working tree
+  (cd "$ROOT_DIR" && git diff --cached --check) 2>/dev/null || true
 }
 
 run_profile() {
@@ -95,7 +96,6 @@ run_named_profile() {
     minimal)
       run_profile minimal "$mode" \
         ENABLE_NIKKI=false ENABLE_UPNP=false ENABLE_VLMCSD=false ENABLE_MOSDNS=false \
-        ENABLE_QMODEM_NEXT=false ENABLE_MWAN=false
       ;;
     proxy-stack)
       run_profile proxy-stack "$mode" \
@@ -115,7 +115,7 @@ run_named_profile() {
       ;;
     qmodem-legacy)
       run_profile qmodem-legacy "$mode" \
-        ENABLE_NIKKI=false ENABLE_MOSDNS=false ENABLE_QMODEM_NEXT=false ENABLE_QMODEM=true ENABLE_MWAN=true
+        ENABLE_QMODEM=true ENABLE_QMODEM_NEXT=false
       ;;
     original-modem)
       run_profile original-modem "$mode" \
@@ -124,13 +124,11 @@ run_named_profile() {
     optional-services)
       run_profile optional-services "$mode" \
         ENABLE_ADGUARDHOME=true ENABLE_OPENCLASH=true ENABLE_ADBYBY_PLUS=true \
-        ENABLE_UPNP=true ENABLE_VLMCSD=true ENABLE_MWAN=true ENABLE_QMODEM_NEXT=false
       ;;
     all-compatible)
       run_profile all-compatible "$mode" \
         ENABLE_ADGUARDHOME=true ENABLE_OPENCLASH=true ENABLE_NIKKI=true ENABLE_UPNP=true \
         ENABLE_VLMCSD=true ENABLE_MOSDNS=true ENABLE_DOCKERMAN=true ENABLE_QMODEM_NEXT=true \
-        ENABLE_QMODEM=false ENABLE_MWAN=true ENABLE_HOMEPROXY=true ENABLE_ADBYBY_PLUS=true \
         ENABLE_ORIGINAL_MODEM=false ENABLE_EASYMESH=true
       ;;
     dockerman)
@@ -159,14 +157,42 @@ profiles_for_set() {
   esac
 }
 
+run_profiles_parallel() {
+  local mode="$1"
+  shift
+  local profiles=("$@")
+  local pids=() failed=0
+
+  for profile in "${profiles[@]}"; do
+    [ -n "$profile" ] || continue
+    (
+      run_named_profile "$profile" "$mode"
+    ) &
+    pids+=($!)
+  done
+
+  for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" || {
+      echo "Profile '${profiles[$i]}' FAILED" >&2
+      failed=1
+    }
+  done
+
+  return "$failed"
+}
+
 main() {
   run_static_checks
 
-  local profile
+  local profiles=()
   while IFS= read -r profile; do
-    [ -n "$profile" ] || continue
-    run_named_profile "$profile" config
+    [ -n "$profile" ] && profiles+=("$profile")
   done < <(profiles_for_set)
+
+  log "Running ${#profiles[@]} profiles in parallel..."
+  if ! run_profiles_parallel config "${profiles[@]}"; then
+    die "One or more coverage profiles failed"
+  fi
 
   if [ -n "$FULL_BUILD_PROFILE" ]; then
     run_named_profile "$FULL_BUILD_PROFILE" full

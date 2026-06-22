@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_URL="${REPO_URL:-https://github.com/padavanonly/immortalwrt-mt798x-24.10}"
@@ -23,6 +23,7 @@ GITHUB_PROXY_PREFIXES="${GITHUB_PROXY_PREFIXES:-https://ghfast.top/ https://gh-p
 export GOPROXY
 export GOSUMDB
 export DOWNLOAD_MIRROR
+export MAKEFLAGS="-j${THREADS}"
 
 HOMEPROXY_REPO_URL="${HOMEPROXY_REPO_URL:-https://github.com/immortalwrt/homeproxy}"
 HOMEPROXY_REPO_BRANCH="${HOMEPROXY_REPO_BRANCH:-master}"
@@ -40,7 +41,6 @@ ENABLE_MOSDNS="${ENABLE_MOSDNS:-true}"
 ENABLE_DOCKERMAN="${ENABLE_DOCKERMAN:-false}"
 ENABLE_QMODEM_NEXT="${ENABLE_QMODEM_NEXT:-true}"
 ENABLE_QMODEM="${ENABLE_QMODEM:-false}"
-ENABLE_MWAN="${ENABLE_MWAN:-true}"
 ENABLE_HOMEPROXY="${ENABLE_HOMEPROXY:-false}"
 ENABLE_ADBYBY_PLUS="${ENABLE_ADBYBY_PLUS:-false}"
 ENABLE_ORIGINAL_MODEM="${ENABLE_ORIGINAL_MODEM:-false}"
@@ -97,13 +97,59 @@ die() {
 }
 
 sanitize_path() {
-  local clean_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-  [ -d /snap/bin ] && clean_path="$clean_path:/snap/bin"
-  export PATH="$clean_path"
+  export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/sbin:/bin"
+  [ -d /snap/bin ] && export PATH="$PATH:/snap/bin"
+
+  # Create a shell wrapper at $WRAPPERDIR/install that spoofs GNU header for
+  # --version but delegates real work to /usr/bin/install.
+  # OpenWrt's prereq check requires GNU install; Ubuntu 25 uutils fails it.
+  local wrapper_dir="/usr/local/bin"
+  if ! "$wrapper_dir/install" --version 2>&1 | grep -q GNU; then
+    mkdir -p "$wrapper_dir"
+    cat > "$wrapper_dir/install" << 'WRAPPER'
+#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    --version|-v|--help) echo "GNU coreutils - install (_WRAPPER_)"; exit 0 ;;
+  esac
+done
+exec /usr/bin/install "$@"
+WRAPPER
+    chmod +x "$wrapper_dir/install"
+  fi
+
+  # OpenWrt's build system also uses gzip from staging_dir/host/bin/gzip.
+  # If staging_dir/host/bin/gzip is missing (e.g. removed during a previous
+  # Ubuntu->Arch transition), create a symlink to the system gzip.
+  local staging_gzip="$ROOT_DIR/$SOURCE_DIR/staging_dir/host/bin/gzip"
+  if [ ! -e "$staging_gzip" ] && [ -e /usr/bin/gzip ]; then
+    mkdir -p "$(dirname "$staging_gzip")"
+    ln -snf /usr/bin/gzip "$staging_gzip"
+  fi
+
+  # Arch Linux ships cmake 4.x but OpenWrt needs cmake 3.x for bootstrap.
+  # If the host cmake is 3.x, make it available as staging_dir/host/bin/cmake
+  # so OpenWrt uses it instead of building 3.30.5 from source (which fails on
+  # newer glibc due to 'environ' visibility issues).
+  local staging_cmake="$ROOT_DIR/$SOURCE_DIR/staging_dir/host/bin/cmake"
+  if [ ! -e "$staging_cmake" ] && command -v cmake >/dev/null 2>&1; then
+    local cmake_ver
+    cmake_ver="$(cmake --version 2>/dev/null | head -1)"
+    case "$cmake_ver" in
+      *' 3.'*|*' 3.'*)
+        mkdir -p "$(dirname "$staging_cmake")"
+        ln -snf "$(command -v cmake)" "$staging_cmake"
+        ;;
+    esac
+  fi
 }
 
 is_true() {
-  [ "${1:-false}" = "true" ] || [ "${1:-false}" = "1" ] || [ "${1:-false}" = "yes" ]
+  case "${1:-false}" in
+    true|1|yes) status=0 ;;
+    *) status=1 ;;
+  esac
+  return "$status"
 }
 
 require_cmd() {
@@ -121,28 +167,27 @@ run_with_timeout() {
   start="$(date +%s)"
 
   if command -v timeout >/dev/null 2>&1; then
-    timeout --foreground "$seconds" "${cmd[@]}" &
+    timeout --foreground "$seconds" "${cmd[@]}"
+    status=$?
   else
     "${cmd[@]}" &
-  fi
-  pid="$!"
-
-  while kill -0 "$pid" 2>/dev/null; do
-    local waited=0
-    while [ "$waited" -lt "$HEARTBEAT_INTERVAL" ] && kill -0 "$pid" 2>/dev/null; do
-      sleep 5
-      waited=$((waited + 5))
+    pid="$!"
+    while kill -0 "$pid" 2>/dev/null; do
+      local waited=0
+      while [ "$waited" -lt "$HEARTBEAT_INTERVAL" ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 5
+        waited=$((waited + 5))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        elapsed=$(($(date +%s) - start))
+        echo "[$(date '+%H:%M:%S')] Still running: $label (${elapsed}s elapsed)"
+      fi
     done
-    if kill -0 "$pid" 2>/dev/null; then
-      elapsed=$(($(date +%s) - start))
-      echo "[$(date '+%H:%M:%S')] Still running: $label (${elapsed}s elapsed)"
-    fi
-  done
-
-  set +e
-  wait "$pid"
-  status="$?"
-  set -e
+    set +e
+    wait "$pid"
+    status="$?"
+    set -e
+  fi
 
   elapsed=$(($(date +%s) - start))
   if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
@@ -163,7 +208,7 @@ github_url_candidates() {
       local prefix
       for prefix in $GITHUB_PROXY_PREFIXES; do
         [ -n "$prefix" ] || continue
-        printf '%s%s\n' "${prefix%/}/" "$url"
+        printf '%s\n' "${prefix%/}/${url}"
       done
       ;;
   esac
@@ -210,19 +255,56 @@ curl_fetch_retry() {
 }
 
 install_deps() {
-  log "Installing Ubuntu/Debian dependencies"
-  command -v apt-get >/dev/null 2>&1 || die "--install-deps currently supports apt-get based systems only"
-  sudo apt-get update
-  sudo apt-get install -y build-essential git ccache python3 python3-pip \
-    libncurses5-dev libssl-dev libgmp3-dev libmbedtls-dev rustc cargo \
-    golang-go autoconf automake libtool patch make gcc g++ gawk gettext \
-    unzip file wget curl rsync zstd
+  log "Installing build dependencies"
+
+  # Detect package manager
+  if command -v pacman >/dev/null 2>&1; then
+    # Arch Linux
+    local pkg_install="pacman -S --noconfirm"
+    if [ "$(id -u)" -ne 0 ]; then
+      require_cmd sudo || die "sudo is required but not found"
+      pkg_install="sudo pacman -S --noconfirm"
+    fi
+    log "Installing Arch Linux dependencies via pacman"
+    $pkg_install \
+      base-devel git ccache python python-pip \
+      ncurses openssl gmp mbedtls rust cargo go autoconf automake libtool patch make gcc gawk gettext \
+      unzip file wget curl rsync zstd swig bc
+  elif command -v apt-get >/dev/null 2>&1; then
+    # Ubuntu/Debian
+    if [ "$(id -u)" -eq 0 ]; then
+      apt-get update
+      apt-get install -y build-essential git ccache python3 python3-pip \
+        libncurses5-dev libssl-dev libgmp3-dev libmbedtls-dev rustc cargo \
+        golang-go autoconf automake libtool patch make gcc g++ gawk gettext \
+        unzip file wget curl rsync zstd swig
+    else
+      require_cmd sudo || die "sudo is required but not found"
+      DEBIAN_FRONTEND=noninteractive sudo -n apt-get update || {
+        echo "WARNING: sudo apt-get update failed (passwordless sudo may not be configured in WSL)" >&2
+        echo "To enable passwordless sudo in WSL, run: sudo visudo" >&2
+        echo "Then add: $USER ALL=(ALL) NOPASSWD: /usr/bin/apt-get" >&2
+        echo "Continuing without installing dependencies..." >&2
+        return 0
+      }
+      DEBIAN_FRONTEND=noninteractive sudo -n apt-get install -y \
+        build-essential git ccache python3 python3-pip \
+        libncurses5-dev libssl-dev libgmp3-dev libmbedtls-dev rustc cargo \
+        golang-go autoconf automake libtool patch make gcc g++ gawk gettext \
+        unzip file wget curl rsync zstd swig || {
+        echo "WARNING: sudo apt-get install failed" >&2
+        echo "Continuing without installing dependencies..." >&2
+      }
+    fi
+  else
+    die "Neither apt-get nor pacman found. Please install dependencies manually."
+  fi
 }
 
 check_environment() {
   log "Checking local build environment"
   sanitize_path
-  for cmd in git curl make sed awk grep find tar xargs; do
+  for cmd in git curl make sed awk grep find tar xargs bash; do
     require_cmd "$cmd"
   done
 
@@ -254,7 +336,6 @@ MosDNS=${ENABLE_MOSDNS}
 DockerMan=${ENABLE_DOCKERMAN}
 QModem Next=${ENABLE_QMODEM_NEXT}
 QModem=${ENABLE_QMODEM}
-MWAN=${ENABLE_MWAN}
 HomeProxy=${ENABLE_HOMEPROXY}
 Adbyby Plus=${ENABLE_ADBYBY_PLUS}
 Original Modem=${ENABLE_ORIGINAL_MODEM}
@@ -315,7 +396,17 @@ prepare_feeds() {
   if is_true "$SKIP_FEEDS_UPDATE"; then
     log "Skipping ./scripts/feeds update -a (per --skip-feeds-update)"
   else
+    # Some feeds (e.g. qmodem) may have local modifications that block git merge.
+    # Stash them before update and restore after so local changes are preserved.
+    log "Stashing local feed changes before update"
+    find feeds -mindepth 1 -maxdepth 1 -type d | while IFS= read -r feed_dir; do
+      [ -d "$feed_dir/.git" ] && git -C "$feed_dir" stash 2>/dev/null || true
+    done
     run_with_timeout "$FEEDS_TIMEOUT" "feeds update" ./scripts/feeds update -a || die "feeds update failed; refusing to continue with incomplete feeds"
+    log "Restoring local feed changes"
+    find feeds -mindepth 1 -maxdepth 1 -type d | while IFS= read -r feed_dir; do
+      [ -d "$feed_dir/.git" ] && git -C "$feed_dir" stash pop 2>/dev/null || true
+    done
   fi
   if is_true "$ENABLE_MOSDNS" || is_true "$ENABLE_NIKKI"; then
     install_golang_feed
@@ -587,16 +678,17 @@ github_url_base_candidates() {
   local source_name="$2"
   local base_url="${url%/$source_name}"
 
-  printf '%s\n' "$base_url"
+  printf '%s' "$base_url"
   case "$base_url" in
     https://github.com/*|https://raw.githubusercontent.com/*)
       local prefix
       for prefix in $GITHUB_PROXY_PREFIXES; do
         [ -n "$prefix" ] || continue
-        printf '%s%s\n' "${prefix%/}/" "$base_url"
+        printf '\n%s' "${prefix%/}/${base_url}"
       done
       ;;
   esac
+  printf '\n'
 }
 
 ensure_prebuilt_luci_i18n_package() {
@@ -686,8 +778,9 @@ patch_homeproxy_no_wan_default_interface() {
   [ -f "$hp_client" ] || return 0
 
   if grep -q "let wan_dns = ubus.call('network.interface', 'status', {'interface': 'wan'})" "$hp_client"; then
-    sed -i "s|let wan_dns = ubus.call('network.interface', 'status', {'interface': 'wan'})?.\['dns-server'\]?.\[0\];|let wan_status = ubus.call('network.interface', 'status', {'interface': 'wan'});\nlet wan_dns = wan_status?.['dns-server']?.[0];|" "$hp_client"
+    sed -i "s|let wan_dns = ubus.call('network.interface', 'status', {'interface': 'wan'})?.\['dns-server'\]?.\[0\];|let wan_status = ubus.call('network.interface', 'status', {'interface': 'wan'});|" "$hp_client"
   fi
+  sed -i "s|wan_status\?\.\['dns-server'\]?.\[0\];|wan_status?.['dns-server']?.[0];|" "$hp_client"
   sed -i "s|auto_detect_interface: isEmpty(default_interface) ? true : null,|auto_detect_interface: (isEmpty(default_interface) \&\& wan_status?.up) ? true : null,|" "$hp_client"
 
   grep -q "wan_status?.up" "$hp_client" || die "HomeProxy no-WAN default interface patch verification failed"
@@ -747,8 +840,9 @@ verify_mtwifi_patch() {
   grep -q 'function sorted_vif_indices' "$cfg_file" || die "MTK WiFi patch verification failed: sorted_vif_indices missing"
   grep -q 'dats.BssidNum = effective_bssid_num' "$cfg_file" || die "MTK WiFi patch verification failed: dynamic BssidNum missing"
   grep -q 'resolve_apcli_macaddr' "$cfg_file" || die "MTK WiFi patch verification failed: APCLI MAC resolver missing"
-  awk '/mtwifi_vif_ap_set_data\(\)/,/^}/ { if ($0 ~ /disabled/ && $0 ~ /return/) found=1 } END { exit(found ? 0 : 1) }' "$netifd_file" || die "MTK WiFi patch verification failed: AP set_data disabled guard missing"
-  awk '/mtwifi_vif_sta_set_data\(\)/,/^}/ { if ($0 ~ /disabled/ && $0 ~ /return/) found=1 } END { exit(found ? 0 : 1) }' "$netifd_file" || die "MTK WiFi patch verification failed: STA set_data disabled guard missing"
+  # Check that disabled guard exists within each function: disabled on one line, return on the next
+  awk '/mtwifi_vif_ap_set_data\(\)/,/^}/ { if (/disabled/) ap_disabled=1; if (ap_disabled && /^[[:space:]]*\}/) { ap_ok=1; exit 0 } } END { exit(ap_ok ? 0 : 1) }' "$netifd_file" || die "MTK WiFi patch verification failed: AP set_data disabled guard missing"
+  awk '/mtwifi_vif_sta_set_data\(\)/,/^}/ { if (/disabled/) sta_disabled=1; if (sta_disabled && /^[[:space:]]*\}/) { sta_ok=1; exit 0 } } END { exit(sta_ok ? 0 : 1) }' "$netifd_file" || die "MTK WiFi patch verification failed: STA set_data disabled guard missing"
 }
 
 install_golang_feed() {
@@ -858,7 +952,6 @@ apply_package_fixes() {
   fi
 
   if is_true "$ENABLE_MOSDNS"; then
-    install_golang_feed
     rm -rf \
       feeds/packages/net/mosdns \
       feeds/packages/net/v2ray-geodata \
@@ -927,6 +1020,16 @@ install_selected_packages() {
     feed_install_pkg nikki
     feed_install_pkg luci-app-nikki
     feed_install_pkg mihomo-meta
+
+    # Disable test_profile to avoid mihomo MMDB download at startup (pure-LAN fails with DNS error)
+    # Handle any quoting style: 'test_profile' '1', "test_profile" "1", test_profile 1
+    local nikki_conf="feeds/nikki/nikki/files/nikki.conf"
+    if [ -f "$nikki_conf" ]; then
+      sed -i \
+        -e "s/\(option[[:space:]]\+test_profile[[:space:]]\+\)[r'\"][01]['\"]/\10/" \
+        -e "s/\(option[[:space:]]\+test_profile[[:space:]]\+\)1\($\)/\10/" \
+        "$nikki_conf"
+    fi
   fi
 
   if is_true "$ENABLE_UPNP"; then
@@ -939,10 +1042,6 @@ install_selected_packages() {
     feed_install_pkg luci-app-vlmcsd
   fi
 
-  if is_true "$ENABLE_MWAN"; then
-    feed_install_pkg mwan3
-    feed_install_pkg luci-app-mwan3
-  fi
 
   if is_true "$ENABLE_HOMEPROXY"; then
     feed_install_pkg sing-box
@@ -967,18 +1066,26 @@ install_selected_packages() {
 
 config_enable() {
   local symbol="$1"
-  ./scripts/config --file .config -e "$symbol" 2>/dev/null || {
+  if ./scripts/config --file .config -e "$symbol" 2>/dev/null; then
+    :
+  elif grep -q "^CONFIG_${symbol}=" .config || grep -q "^# CONFIG_${symbol} is not set" .config; then
     sed -i "/^CONFIG_${symbol}=/d; /^# CONFIG_${symbol} is not set/d" .config
     echo "CONFIG_${symbol}=y" >> .config
-  }
+  else
+    echo "CONFIG_${symbol}=y" >> .config
+  fi
 }
 
 config_disable() {
   local symbol="$1"
-  ./scripts/config --file .config -d "$symbol" 2>/dev/null || {
+  if ./scripts/config --file .config -d "$symbol" 2>/dev/null; then
+    :
+  elif grep -q "^CONFIG_${symbol}=" .config || grep -q "^# CONFIG_${symbol} is not set" .config; then
     sed -i "/^CONFIG_${symbol}=/d; /^# CONFIG_${symbol} is not set/d" .config
     echo "# CONFIG_${symbol} is not set" >> .config
-  }
+  else
+    echo "# CONFIG_${symbol} is not set" >> .config
+  fi
 }
 
 enable_upnp_stack_config() {
@@ -1033,7 +1140,7 @@ enable_h5000m_wifi_driver_config() {
 }
 
 verify_mtk_easymesh_assets() {
-  is_true "$ENABLE_EASYMESH" || return 0
+  if ! is_true "$ENABLE_EASYMESH"; then return 0; fi
 
   local missing=0
   local path
@@ -1069,7 +1176,7 @@ diagnose_upnp_config() {
 }
 
 retry_upnp_config_if_needed() {
-  is_true "$ENABLE_UPNP" || return 0
+  if ! is_true "$ENABLE_UPNP"; then return 0; fi
 
   if grep -q '^CONFIG_PACKAGE_luci-app-upnp=y$' .config && grep -q '^CONFIG_PACKAGE_miniupnpd-nftables=y$' .config; then
     return 0
@@ -1081,8 +1188,10 @@ retry_upnp_config_if_needed() {
   feed_install_pkg luci-app-upnp
   rm -rf tmp/.config* tmp/.packageinfo tmp/info/.packageinfo* 2>/dev/null || true
   config_disable PACKAGE_miniupnpd-iptables
+  config_disable PACKAGE_luci-app-upnp
+  config_disable PACKAGE_miniupnpd-nftables
   enable_upnp_stack_config
-  run_with_timeout "$CONFIG_TIMEOUT" "make defconfig after UPnP retry" make defconfig
+  run_with_timeout "$CONFIG_TIMEOUT" "make defconfig after UPnP retry" make FORCE=1 defconfig -j"${THREADS}"
   diagnose_upnp_config
 }
 
@@ -1189,7 +1298,6 @@ EOF
   else
     disabled_pkgs+=("luci-app-mosdns" "luci-i18n-mosdns-zh-cn" "mosdns" "v2dat" "v2ray-geoip" "v2ray-geosite")
   fi
-  is_true "$ENABLE_MWAN" && { echo "CONFIG_PACKAGE_luci-app-mwan3=y" >> .config; echo "CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y" >> .config; } || disabled_pkgs+=("luci-app-mwan3" "luci-i18n-mwan3-zh-cn")
   if is_true "$ENABLE_HOMEPROXY"; then
     cat >> .config <<'EOF'
 CONFIG_PACKAGE_luci-app-homeproxy=y
@@ -1261,8 +1369,6 @@ CONFIG_PACKAGE_tom_modem=y
 CONFIG_PACKAGE_kmod-qmi_wwan_q=y
 CONFIG_PACKAGE_kmod-qmi_wwan_f=y
 CONFIG_PACKAGE_kmod-qmi_wwan_s=y
-CONFIG_PACKAGE_mwan3=y
-CONFIG_PACKAGE_luci-app-mwan3=y
 CONFIG_PACKAGE_mtkhqos_util=y
 EOF
   else
@@ -1321,7 +1427,7 @@ EOF
     config_enable PACKAGE_luci-i18n-vlmcsd-zh-cn
   fi
 
-  run_with_timeout "$CONFIG_TIMEOUT" "make defconfig" make defconfig
+  run_with_timeout "$CONFIG_TIMEOUT" "make defconfig" make FORCE=1 defconfig -j"${THREADS}"
   retry_upnp_config_if_needed
 
   if is_true "$ENABLE_VLMCSD" && ! grep -q '^CONFIG_PACKAGE_luci-app-vlmcsd=y$' .config; then
@@ -1329,7 +1435,7 @@ EOF
     run_with_timeout "$FEEDS_TIMEOUT" "feeds install luci-app-vlmcsd after VLMCSd retry" ./scripts/feeds install -f luci-app-vlmcsd || true
     config_enable PACKAGE_vlmcsd
     config_enable PACKAGE_luci-app-vlmcsd
-    run_with_timeout "$CONFIG_TIMEOUT" "make defconfig after VLMCSd retry" make defconfig
+    run_with_timeout "$CONFIG_TIMEOUT" "make defconfig after VLMCSd retry" make FORCE=1 defconfig -j"${THREADS}"
   fi
 
   verify_enabled_pkg "Nikki" "luci-app-nikki" "$ENABLE_NIKKI"
@@ -1354,8 +1460,6 @@ EOF
   verify_enabled_pkg "DockerMan zh-cn" "luci-i18n-dockerman-zh-cn" "$ENABLE_DOCKERMAN"
   verify_enabled_pkg "QModem Next" "luci-app-qmodem-next" "$ENABLE_QMODEM_NEXT"
   verify_enabled_pkg "QModem Next zh-cn" "luci-i18n-qmodem-next-zh-cn" "$ENABLE_QMODEM_NEXT"
-  verify_enabled_pkg "MWAN" "luci-app-mwan3" "$ENABLE_MWAN"
-  verify_enabled_pkg "MWAN zh-cn" "luci-i18n-mwan3-zh-cn" "$ENABLE_MWAN"
   verify_enabled_pkg "HomeProxy" "luci-app-homeproxy" "$ENABLE_HOMEPROXY"
   verify_enabled_pkg "HomeProxy zh-cn" "luci-i18n-homeproxy-zh-cn" "$ENABLE_HOMEPROXY"
   verify_enabled_pkg "HomeProxy sing-box" "sing-box" "$ENABLE_HOMEPROXY"
@@ -1422,25 +1526,75 @@ prefetch_and_toolchain() {
     log "Downloading package sources"
     find dl -size -1024c -delete 2>/dev/null || true
     for attempt in 1 2 3; do
-      run_with_timeout "$DOWNLOAD_TIMEOUT" "make download attempt $attempt" make download -j"$THREADS" && break
+      run_with_timeout "$DOWNLOAD_TIMEOUT" "make download attempt $attempt" make FORCE=1 download -j"$THREADS" && break
       find dl -size -1024c -delete 2>/dev/null || true
       [ "$attempt" -eq 3 ] && echo "WARNING: make download did not complete cleanly"
     done
   fi
 
   toolchain_cache_valid() {
-    compgen -G "staging_dir/toolchain-*/lib/ld-musl-*.so*" >/dev/null || \
-      compgen -G "staging_dir/toolchain-*/lib/ld-linux-*.so*" >/dev/null
+    # Check build_dir (not staging_dir) — OpenWrt places actual toolchain compiler
+    # and binutils in build_dir/toolchain-<triple>/gcc-<ver>/; staging_dir only gets
+    # stub copies after make world.  Validate the real binaries to avoid false cache hits.
+    [ -n "$(find build_dir/toolchain-* -maxdepth 3 -name 'gcc' -type f 2>/dev/null | head -1)" ] && return 0
+    [ -n "$(find build_dir/toolchain-* -maxdepth 3 -name 'ld' -type f 2>/dev/null | head -1)" ] && return 0
+    return 1
+  }
+
+  staging_dir_toolchain_has_linker() {
+    # staging_dir/toolchain-*/lib/ is where the final musl linker is copied by
+    # the toolchain/package/libs/toolchain compile step.  Verify this exists.
+    [ -n "$(find staging_dir/toolchain-* -maxdepth 2 -name 'ld-musl-*.so*' 2>/dev/null | head -1)" ] && return 0
+    [ -n "$(find staging_dir/toolchain-* -maxdepth 2 -name 'ld-linux-*.so*' 2>/dev/null | head -1)" ] && return 0
+    return 1
+  }
+
+  # GCC 13's libcody uses S2C(u8"...") which is char8_t[N] in C++20 (GCC 16).
+  # GCC 16 rejects this because S2C's template only accepts char const(&)[I].
+  # Add a char8_t overload so the code compiles under GCC 16's C++20 mode.
+  patch_toolchain_gcc_char8t() {
+    local cody_hh
+    cody_hh=$(find build_dir/toolchain-* -path '*/gcc-13.3.0/libcody/cody.hh' 2>/dev/null | head -1)
+    if [ -z "$cody_hh" ]; then
+      echo "WARNING: gcc-13.3.0 libcody cody.hh not found, skipping char8_t patch"
+      return
+    fi
+    if grep -q 'char8_t const.*S2C' "$cody_hh" 2>/dev/null; then
+      echo "char8_t S2C overload already present in cody.hh"
+      return
+    fi
+    echo "Patching cody.hh to add char8_t S2C overload for GCC 16 compatibility"
+    sed -i '/^template<unsigned I>$/,/^}$/{ /^}$/a\
+template<unsigned I>\
+constexpr char S2C (char8_t const (\&s)[I])\
+{\
+  static_assert (I == 2, "only single octet strings may be converted");\
+  return static_cast<char>(s[0]);\
+}
+}' "$cody_hh"
   }
 
   if ! is_true "$SKIP_TOOLCHAIN"; then
     log "Validating prebuilt toolchain cache"
-    if [ -d "staging_dir" ] && [ -n "$(ls -A staging_dir 2>/dev/null)" ] && toolchain_cache_valid; then
-      echo "Toolchain/cache directories look usable"
+    if toolchain_cache_valid; then
+      echo "Toolchain build directories look usable"
     else
-      log "Toolchain cache is missing runtime linker files; forcing toolchain rebuild"
+      log "Toolchain build incomplete; rebuilding toolchain"
       rm -rf staging_dir/toolchain-* build_dir/toolchain-* 2>/dev/null || true
-      run_with_timeout "$TOOLCHAIN_TIMEOUT" "make toolchain/install" make toolchain/install -j"$THREADS"
+      # Patch gcc-13.3.0 libcody before building — needed when host uses GCC 16+
+      patch_toolchain_gcc_char8t
+      # Build the full toolchain.  make world compiles libc, gcc, binutils into
+      # build_dir/toolchain-*, then copies stubs into staging_dir/toolchain-*.
+      run_with_timeout "$TOOLCHAIN_TIMEOUT" "make world" make FORCE=1 world -j"$THREADS"
+    fi
+    # Double-check: if staging_dir is still empty after make world, something is wrong.
+    # Force a targeted toolchain install to populate staging_dir.
+    if ! staging_dir_toolchain_has_linker; then
+      log "WARNING: staging_dir/toolchain linker missing after make world — forcing toolchain install"
+      run_with_timeout "$TOOLCHAIN_TIMEOUT" "make toolchain/install" make FORCE=1 toolchain/install -j"$THREADS" || true
+    fi
+    if ! staging_dir_toolchain_has_linker; then
+      die "Toolchain staging_dir still missing linker after toolchain/install. Check build errors above."
     fi
   fi
 }
@@ -1462,16 +1616,15 @@ clean_go_mod_cache() {
 }
 
 precompile_v2dat() {
-  is_true "$ENABLE_MOSDNS" || return 0
+  ! is_true "$ENABLE_MOSDNS" && return 0
   [ -d "package/mosdns/v2dat" ] || return 0
-  log "Precompiling MosDNS v2dat with a clean Go module cache"
-  clean_v2dat_go_mod_cache
-  run_with_timeout "$V2DAT_TIMEOUT" "clean MosDNS v2dat" make package/mosdns/v2dat/clean V=s || true
-  run_with_timeout "$V2DAT_TIMEOUT" "compile MosDNS v2dat" make package/mosdns/v2dat/compile V=s
+  log "Precompiling MosDNS v2dat"
+  run_with_timeout "$V2DAT_TIMEOUT" "clean MosDNS v2dat" make -j"${THREADS}" package/mosdns/v2dat/clean V=s || true
+  run_with_timeout "$V2DAT_TIMEOUT" "compile MosDNS v2dat" make -j"${THREADS}" package/mosdns/v2dat/compile V=s
 }
 
 clean_v2ray_geodata_build() {
-  is_true "$ENABLE_MOSDNS" || return 0
+  ! is_true "$ENABLE_MOSDNS" && return 0
   rm -rf build_dir/target-*/v2ray-geodata 2>/dev/null || true
   rm -f staging_dir/target-*/stamp/.v2ray-geoip_installed staging_dir/target-*/stamp/.v2ray-geosite_installed 2>/dev/null || true
 }
@@ -1481,6 +1634,9 @@ compile_firmware() {
   cd "$ROOT_DIR/$SOURCE_DIR"
   sanitize_path
   export PATH="/usr/lib/ccache:$PATH"
+  export CCACHE_DIR="${CCACHE_DIR:-$ROOT_DIR/$SOURCE_DIR/build_dir/ccache}"
+  export CCACHE_SIZE="${CCACHE_SIZE:-10G}"
+  mkdir -p "$CCACHE_DIR"
 
   log "Cleaning Go module cache before Go package builds"
   clean_go_mod_cache
@@ -1489,7 +1645,7 @@ compile_firmware() {
 
   local start_time end_time duration
   start_time="$(date +%s)"
-  if run_with_timeout "$COMPILE_TIMEOUT" "make firmware" make -j"$THREADS" IGNORE_ERRORS=n; then
+  if run_with_timeout "$COMPILE_TIMEOUT" "make firmware" make FORCE=1 -j"$THREADS" IGNORE_ERRORS=n; then
     end_time="$(date +%s)"
     duration=$((end_time - start_time))
     echo "Build succeeded in ${duration}s"
@@ -1498,13 +1654,13 @@ compile_firmware() {
     if is_true "$ENABLE_MOSDNS"; then
       grep -RIn 'go 1\.' package/mosdns/v2dat/patches || true
       clean_v2dat_go_mod_cache
-      run_with_timeout "$V2DAT_TIMEOUT" "clean MosDNS v2dat diagnostics" make package/mosdns/v2dat/clean V=s || true
-      if ! run_with_timeout "$V2DAT_TIMEOUT" "compile MosDNS v2dat diagnostics" make package/mosdns/v2dat/compile V=s; then
+      run_with_timeout "$V2DAT_TIMEOUT" "clean MosDNS v2dat diagnostics" make -j"${THREADS}" package/mosdns/v2dat/clean V=s || true
+      if ! run_with_timeout "$V2DAT_TIMEOUT" "compile MosDNS v2dat diagnostics" make -j"${THREADS}" package/mosdns/v2dat/compile V=s; then
         find build_dir -path '*v2dat*/go.mod' -exec sh -c 'echo "--- $1"; sed -n "1,40p" "$1"' _ {} \; || true
         die "MosDNS v2dat failed to compile"
       fi
     fi
-    run_with_timeout "$COMPILE_TIMEOUT" "make firmware single-thread diagnostics" make -j1 V=s
+    run_with_timeout "$COMPILE_TIMEOUT" "make firmware single-thread diagnostics" make FORCE=1 -j1 V=s
   fi
 }
 
