@@ -117,7 +117,7 @@ jobs:
   config-coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    if: github.event.inputs.run_config_coverage == 'true'
+    if: github.event.inputs.run_config_coverage == true
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
