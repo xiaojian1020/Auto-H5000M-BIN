@@ -59,9 +59,24 @@ on:
         default: false
         type: boolean
       enable_original_modem:
-        description: '启用原版 Modem（luci-app-modem + ModemManager，支持 Quectel RG501Q-EU/RM5xxQ 等 QMI 5G 模块）'
+        description: '启用原版 Modem（luci-app-modem + ModemManager，支持 Quectel RG501Q-EU/RM5xxQ 等 QMI 5G 模块）。与 QModem 互斥——启用 QModem 时会被自动禁用。'
+        required: false
+        default: false
+        type: boolean
+      enable_qmodem:
+        description: '启用 QModem (FUjr/QModem，Quectel/Fibocom/MEIG/SIMCOM 5G modem LuCI 面板，原版 luci-app-modem 不覆盖 RG501Q-EU 等专用 5G 驱动时启用。与原版 modem 互斥。'
         required: false
         default: true
+        type: boolean
+      enable_qmodem_next:
+        description: 'QModem 新版 JS LuCI (luci-app-qmodem-next)。默认启用；与 lua 版互斥。'
+        required: false
+        default: true
+        type: boolean
+      enable_qmodem_lua:
+        description: 'QModem 经典 Lua LuCI (luci-app-qmodem)。与 qmodem-next 互斥。'
+        required: false
+        default: false
         type: boolean
       enable_adblock:
         description: '启用 Adblock（DNS 层广告/恶意域名过滤，依赖 dnsmasq/unbound/smartdns）'
@@ -131,7 +146,8 @@ jobs:
           declare -A scheduled_defaults=(
             [enable_adguardhome]=false [enable_openclash]=false [enable_nikki]=true
             [enable_upnp]=true [enable_vlmcsd]=true [enable_mosdns]=true [enable_dockerman]=false
-            [enable_homeproxy]=false [enable_original_modem]=true [enable_adblock]=true
+            [enable_homeproxy]=false [enable_original_modem]=false [enable_adblock]=true
+            [enable_qmodem]=true [enable_qmodem_next]=true [enable_qmodem_lua]=false
             [publish_release]=true [run_config_coverage]=false [coverage_profile_set]=quick
             [full_build_smoke_profile]=''
           )
@@ -146,6 +162,9 @@ jobs:
             [enable_homeproxy]='${{ github.event.inputs.enable_homeproxy }}'
             [enable_original_modem]='${{ github.event.inputs.enable_original_modem }}'
             [enable_adblock]='${{ github.event.inputs.enable_adblock }}'
+            [enable_qmodem]='${{ github.event.inputs.enable_qmodem }}'
+            [enable_qmodem_next]='${{ github.event.inputs.enable_qmodem_next }}'
+            [enable_qmodem_lua]='${{ github.event.inputs.enable_qmodem_lua }}'
             [publish_release]='${{ github.event.inputs.publish_release }}'
             [run_config_coverage]='${{ github.event.inputs.run_config_coverage }}'
             [coverage_profile_set]='${{ github.event.inputs.coverage_profile_set }}'
@@ -210,7 +229,8 @@ jobs:
           declare -A defaults=(
             [enable_adguardhome]=false [enable_openclash]=false [enable_nikki]=true
             [enable_upnp]=true [enable_vlmcsd]=true [enable_mosdns]=true [enable_dockerman]=false
-            [enable_homeproxy]=false [enable_original_modem]=true [enable_adblock]=true
+            [enable_homeproxy]=false [enable_original_modem]=false [enable_adblock]=true
+            [enable_qmodem]=true [enable_qmodem_next]=true [enable_qmodem_lua]=false
             [publish_release]=true
           )
           declare -A inputs=(
@@ -224,6 +244,9 @@ jobs:
             [enable_homeproxy]='${{ github.event.inputs.enable_homeproxy }}'
             [enable_original_modem]='${{ github.event.inputs.enable_original_modem }}'
             [enable_adblock]='${{ github.event.inputs.enable_adblock }}'
+            [enable_qmodem]='${{ github.event.inputs.enable_qmodem }}'
+            [enable_qmodem_next]='${{ github.event.inputs.enable_qmodem_next }}'
+            [enable_qmodem_lua]='${{ github.event.inputs.enable_qmodem_lua }}'
             [publish_release]='${{ github.event.inputs.publish_release }}'
           )
           for k in "${!defaults[@]}"; do
@@ -301,6 +324,9 @@ jobs:
           ENABLE_HOMEPROXY: ${{ steps.features.outputs.enable_homeproxy }}
           ENABLE_ORIGINAL_MODEM: ${{ steps.features.outputs.enable_original_modem }}
           ENABLE_ADBLOCK: ${{ steps.features.outputs.enable_adblock }}
+          ENABLE_QMODEM: ${{ steps.features.outputs.enable_qmodem }}
+          ENABLE_QMODEM_NEXT: ${{ steps.features.outputs.enable_qmodem_next }}
+          ENABLE_QMODEM_LUA: ${{ steps.features.outputs.enable_qmodem_lua }}
         run: |
           set -euo pipefail
           export PATH="/usr/lib/ccache:$PATH"
@@ -350,6 +376,9 @@ jobs:
             - DockerMan:   ${{ steps.features.outputs.enable_dockerman }}
             - HomeProxy:   ${{ steps.features.outputs.enable_homeproxy }}
             - 原版 Modem:  ${{ steps.features.outputs.enable_original_modem }}
+            - QModem:      ${{ steps.features.outputs.enable_qmodem }}
+              - QModem-Next: ${{ steps.features.outputs.enable_qmodem_next }}
+              - QModem-Lua:  ${{ steps.features.outputs.enable_qmodem_lua }}
             - Adblock:     ${{ steps.features.outputs.enable_adblock }}
           prerelease: false
           make_latest: true

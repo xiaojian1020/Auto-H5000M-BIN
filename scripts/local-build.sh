@@ -41,14 +41,39 @@ ENABLE_MOSDNS="${ENABLE_MOSDNS:-true}"
 ENABLE_DOCKERMAN="${ENABLE_DOCKERMAN:-false}"
 ENABLE_HOMEPROXY="${ENABLE_HOMEPROXY:-false}"
 ENABLE_ADBLOCK="${ENABLE_ADBLOCK:-true}"
-ENABLE_ORIGINAL_MODEM="${ENABLE_ORIGINAL_MODEM:-true}"
+
+# Modem stack selection — QModem and the original luci-app-modem are
+# MUTUALLY EXCLUSIVE because both wire up the same physical QMI/USB/PCIe
+# modem stack (kmod-usb-net-qmi-wwan, quectel-CM-5G, ModemManager) and
+# would fight for /dev/cdc-wdm0 / dev/wwan0 and duplicate UCI /etc/config/modem.
+# ENFORCEMENT happens in resolve_modem_stack() below: enabling QModem
+# automatically disables the original modem (with a loud log).
+ENABLE_ORIGINAL_MODEM="${ENABLE_ORIGINAL_MODEM:-false}"
+
+# QModem (FUjr/QModem) — LuCI panel for Quectel/Fibocom/MEIG/SIMCOM 5G
+# modems. Required for Quectel RG501Q-EU / RM5xxQ series because the
+# upstream luci-app-modem LUCI_DEPENDS does not cover vendor-specific
+# QMI/MHI drivers and upstream defconfig disables them.
+#
+# QModem ships two mutually-exclusive LuCI frontends:
+#   - luci-app-qmodem       (Lua MVC, classic, last major v2.8.11)
+#   - luci-app-qmodem-next  (pure JS, modern, active development)
+# We default to *-next because future features only land there.
+ENABLE_QMODEM="${ENABLE_QMODEM:-true}"
+ENABLE_QMODEM_NEXT="${ENABLE_QMODEM_NEXT:-true}"
+ENABLE_QMODEM_LUA="${ENABLE_QMODEM_LUA:-false}"
 
 INSTALL_DEPS=false
-PREPARE_ONLY=false
-CONFIG_ONLY=false
-SKIP_TOOLCHAIN=false
-SKIP_DOWNLOAD=false
-SKIP_FEEDS_UPDATE=false
+PREPARE_ONLY="${PREPARE_ONLY:-false}"
+CONFIG_ONLY="${CONFIG_ONLY:-false}"
+SKIP_TOOLCHAIN="${SKIP_TOOLCHAIN:-false}"
+SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-false}"
+# SKIP_FEEDS_UPDATE honors any caller-provided environment value (e.g. set
+# via `env SKIP_FEEDS_UPDATE=true` or exported in CI). Only fall back to
+# false when the caller did not specify it. This lets coverage-test.sh and
+# ad-hoc local iterations reuse the existing feeds checkout without paying
+# for a fresh ./scripts/feeds update -a over a flaky network.
+SKIP_FEEDS_UPDATE="${SKIP_FEEDS_UPDATE:-false}"
 
 usage() {
   cat <<'EOF'
@@ -96,6 +121,13 @@ die() {
 sanitize_path() {
   export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/sbin:/bin"
   [ -d /snap/bin ] && export PATH="$PATH:/snap/bin"
+  # Allow users (and CI environments) to extend the sanitized PATH with
+  # custom tool directories (e.g. a local rsync binary on locked-down hosts
+  # where /usr/bin is read-only). PATH_APPEND is appended last so user
+  # tools win over system ones. Default behavior is unchanged when unset.
+  if [ -n "${PATH_APPEND:-}" ]; then
+    export PATH="$PATH:$PATH_APPEND"
+  fi
 
   # Create a shell wrapper at $WRAPPERDIR/install that spoofs GNU header for
   # --version but delegates real work to /usr/bin/install.
@@ -335,6 +367,35 @@ DockerMan=${ENABLE_DOCKERMAN}
 HomeProxy=${ENABLE_HOMEPROXY}
 Adblock=${ENABLE_ADBLOCK}
 Original Modem=${ENABLE_ORIGINAL_MODEM}
+QModem=${ENABLE_QMODEM}
+QModem-Next=${ENABLE_QMODEM_NEXT}
+QModem-Lua=${ENABLE_QMODEM_LUA}
+
+# ENFORCEMENT: QModem and the original luci-app-modem cannot ship together
+# (see comment on ENABLE_ORIGINAL_MODEM). Resolve the conflict here before
+# any feed install or .config write so downstream code sees a single
+# consistent state. If the user explicitly set both, we surface a loud log.
+resolve_modem_stack() {
+  if is_true "$ENABLE_QMODEM" && is_true "$ENABLE_ORIGINAL_MODEM"; then
+    echo "WARNING: ENABLE_QMODEM=true and ENABLE_ORIGINAL_MODEM=true are mutually exclusive."
+    log "Auto-disabling ENABLE_ORIGINAL_MODEM (QModem supersedes luci-app-modem)"
+    echo "  Override with: ENABLE_ORIGINAL_MODEM=false ENABLE_QMODEM=true"
+    ENABLE_ORIGINAL_MODEM=false
+  fi
+  if is_true "$ENABLE_QMODEM_NEXT" && is_true "$ENABLE_QMODEM_LUA"; then
+    echo "WARNING: ENABLE_QMODEM_NEXT=true and ENABLE_QMODEM_LUA=true are mutually exclusive."
+    log "Auto-disabling ENABLE_QMODEM_LUA (qmodem-next supersedes lua qmodem)"
+    ENABLE_QMODEM_LUA=false
+  fi
+  if ! is_true "$ENABLE_QMODEM_NEXT" && ! is_true "$ENABLE_QMODEM_LUA"; then
+    if is_true "$ENABLE_QMODEM"; then
+      echo "WARNING: ENABLE_QMODEM=true but neither *-next nor lua variant is enabled."
+      log "Falling back to qmodem-next (default LuCI frontend)"
+      ENABLE_QMODEM_NEXT=true
+    fi
+  fi
+  export ENABLE_ORIGINAL_MODEM ENABLE_QMODEM_NEXT ENABLE_QMODEM_LUA
+}
 GOPROXY=${GOPROXY}
 GOSUMDB=${GOSUMDB}
 DOWNLOAD_MIRROR=${DOWNLOAD_MIRROR}
@@ -345,7 +406,7 @@ prepare_source() {
   log "Preparing ImmortalWrt source"
   cd "$ROOT_DIR"
 
-  if [ ! -d "$SOURCE_DIR/.git" ]; then
+  if [ ! -d "$SOURCE_DIR/.git" ] && [ ! -f "$SOURCE_DIR/.git" ]; then
     rm -rf "$SOURCE_DIR"
     git_clone_retry "$REPO_URL" "$REPO_BRANCH" "$SOURCE_DIR" 1
   else
@@ -377,18 +438,46 @@ prepare_feeds() {
   if ! is_true "$ENABLE_NIKKI"; then
     sed -i '/src-git nikki/d; /nikki/d' feeds.conf.default
   fi
+  if ! is_true "$ENABLE_QMODEM"; then
+    sed -i '/src-git qmodem/d; /qmodem/d' feeds.conf.default
+  fi
 
-  rm -rf tmp/.config* tmp/.packageinfo tmp/.targetinfo tmp/info tmp/.feeds* feeds/*.tmp 2>/dev/null || true
+  rm -rf tmp/.config* tmp/.packageinfo tmp/.targetinfo tmp/info tmp/.feeds* 2>/dev/null || true
   ! is_true "$ENABLE_NIKKI" && rm -rf feeds/nikki* package/feeds/nikki 2>/dev/null || true
+  ! is_true "$ENABLE_QMODEM" && rm -rf feeds/qmodem* package/feeds/qmodem 2>/dev/null || true
+  # NOTE: feeds/*.tmp (per-feed .packageinfo / .targetinfo caches) is NOT
+  # removed here when SKIP_FEEDS_UPDATE=true. Removing them would force the
+  # later `./scripts/feeds install -f <pkg>` to fail with "No feed for
+  # package 'X' found" because the per-feed install command looks up
+  # packages via feeds/<name>.index → feeds/<name>.tmp/.packageinfo. We
+  # only clear feeds/*.tmp when we are about to regenerate them via a
+  # fresh `./scripts/feeds update -a` (see the SKIP_FEEDS_UPDATE=false
+  # branch below).
 
   ensure_libcrypt_compat_package
 
   if is_true "$SKIP_FEEDS_UPDATE"; then
     log "Skipping ./scripts/feeds update -a (per --skip-feeds-update)"
+    # Ensure each enabled feed directory exists; if SKIP_FEEDS_UPDATE is
+    # set and a previously-used feed (e.g. feeds/qmodem) is missing from
+    # the checkout, fall back to a fresh clone so subsequent feed_install
+    # calls succeed.
+    if is_true "$ENABLE_NIKKI" && [ ! -d "feeds/nikki" ]; then
+      mkdir -p feeds
+      git_clone_retry "https://github.com/nikkinikki-org/OpenWrt-nikki.git" "main" "feeds/nikki" 1 || log "WARNING: unable to fetch Nikki feed; luci-app-nikki will be missing"
+    fi
+    if is_true "$ENABLE_QMODEM" && [ ! -d "feeds/qmodem" ]; then
+      mkdir -p feeds
+      git_clone_retry "https://github.com/FUjr/QModem.git" "main" "feeds/qmodem" 1 || log "WARNING: unable to fetch QModem feed; luci-app-qmodem(-next) and supporting qmodem packages will not be available"
+    fi
   else
     # Some feeds (e.g. nikki) may have local modifications that block git merge.
     # Stash them before update and restore after so local changes are preserved.
     log "Stashing local feed changes before update"
+    # Now safe to clear per-feed .tmp caches — a fresh feeds update will
+    # regenerate them. The SKIP_FEEDS_UPDATE=true branch above skips
+    # this cleanup so the existing .tmp/.packageinfo remains usable.
+    rm -rf feeds/*.tmp 2>/dev/null || true
     find feeds -mindepth 1 -maxdepth 1 -type d | while IFS= read -r feed_dir; do
       [ -d "$feed_dir/.git" ] && git -C "$feed_dir" stash 2>/dev/null || true
     done
@@ -404,6 +493,19 @@ prepare_feeds() {
   if is_true "$ENABLE_NIKKI" && [ ! -d "feeds/nikki" ]; then
     mkdir -p feeds
     git_clone_retry "https://github.com/nikkinikki-org/OpenWrt-nikki.git" "main" "feeds/nikki" 1 || die "Unable to fetch Nikki feed"
+  fi
+  if is_true "$ENABLE_QMODEM" && [ ! -d "feeds/qmodem" ]; then
+    mkdir -p feeds
+    git_clone_retry "https://github.com/FUjr/QModem.git" "main" "feeds/qmodem" 1 || log "WARNING: unable to fetch QModem feed; luci-app-qmodem(-next) and supporting qmodem packages will not be available"
+  fi
+  # QModem upstream references kmod-mhi-wwan / kmod-mhi-wwan-ctrl /
+  # kmod-mhi-wwan-mbim / kmod-mhi-pci-generic / kmod-qca-nss-drv, none of
+  # which exist in immortalwrt-24.10. Patch the QModem tree right after the
+  # clone and before ./scripts/feeds install -a so the WARNING lines about
+  # "dependency on X, which does not exist" are suppressed (the warnings are
+  # not fatal, but they spam CI logs and confuse users).
+  if is_true "$ENABLE_QMODEM" && [ -d "feeds/qmodem" ]; then
+    patch_qmodem_makefile
   fi
   run_with_timeout "$FEEDS_TIMEOUT" "feeds install all" ./scripts/feeds install -a -f || log "WARNING: feeds install -a reported errors; selected packages will be installed explicitly"
 }
@@ -569,6 +671,42 @@ patch_mtk_hnat_local_dest() {
 
   grep -q 'inet_addr_type(&init_net, iph->daddr) == RTN_LOCAL' "$source_file" || \
     die "MTK HNAT local-destination guard patch verification failed"
+}
+
+# QModem upstream Makefiles reference several kmod packages that are NOT
+# present in immortalwrt-24.10's main repository:
+#   - kmod-mhi-wwan, kmod-mhi-wwan-ctrl, kmod-mhi-wwan-mbim (Qualcomm MHI WWAN stack)
+#   - kmod-mhi-pci-generic (Qualcomm MHI PCIe generic driver)
+#   - kmod-qca-nss-drv (Qualcomm IPQ NSS driver)
+# These are referenced under +PACKAGE_luci-app-qmodem_GENERIC_MHI_PCIe_DRIVER and
+# +PACKAGE_luci-app-qmodem_NSS_MHI_PCIe_DRIVER conditionals (only when those
+# LuCI options are enabled) plus in rmnet-nss. On mt798x (MediaTek Filogic)
+# these drivers are irrelevant; we patch them out so OpenWrt's feeds install
+# does not emit WARNING lines about non-existent dependencies and so the
+# final firmware manifest is clean.
+patch_qmodem_makefile() {
+  local qmodem_dir="$ROOT_DIR/$SOURCE_DIR/feeds/qmodem"
+  [ -d "$qmodem_dir" ] || return 0
+
+  if grep -q 'kmod-mhi-wwan\b' "$qmodem_dir/application/qmodem/Makefile" 2>/dev/null; then
+    log "Patching QModem core to drop absent kmod-mhi-wwan family (Qualcomm IPQ only)"
+    sed -i \
+      -e '/kmod-mhi-wwan \\$/d' \
+      -e '/kmod-mhi-pci-generic \\$/d' \
+      -e '/kmod-mhi-wwan-ctrl \\$/d' \
+      -e '/kmod-mhi-wwan-mbim \\$/d' \
+      "$qmodem_dir/application/qmodem/Makefile"
+  fi
+
+  # rmnet-nss references kmod-qca-nss-drv (Qualcomm IPQ NSS driver) — also
+  # not in immortalwrt. Patch the depends clause so the WARNING is silenced
+  # even when the user does not select the qmodem NSS MHI driver.
+  if [ -f "$qmodem_dir/driver/nss/rmnet-nss/Makefile" ]; then
+    if grep -q 'kmod-qca-nss-drv' "$qmodem_dir/driver/nss/rmnet-nss/Makefile" 2>/dev/null; then
+      log "Patching rmnet-nss to drop absent kmod-qca-nss-drv (Qualcomm IPQ only)"
+      sed -i 's/+kmod-qca-nss-drv//g' "$qmodem_dir/driver/nss/rmnet-nss/Makefile"
+    fi
+  fi
 }
 
 # mt_wifi7's sta_mgmt_assoc.c references pStaCfg->wpa_supplicant_info in the
@@ -913,6 +1051,9 @@ apply_package_fixes() {
   patch_mtk_hnat_local_dest
   patch_mtwifi7_sta_mgmt_assoc_hostapd_guard
   ensure_external_luci_i18n_packages
+  if is_true "$ENABLE_QMODEM"; then
+    patch_qmodem_makefile
+  fi
 
   local ebtables_makefile="package/network/utils/ebtables/Makefile"
   if [ -f "$ebtables_makefile" ] && grep -qE 'git(://|s://git\.)netfilter\.org/ebtables' "$ebtables_makefile"; then
@@ -933,6 +1074,30 @@ apply_package_fixes() {
     # upstream luci-app-modem supports standard QMI/ModemManager modems,
     # including Quectel RG501Q-EU/RM5xxQ series. No patching required.
     log "luci-app-modem detected; using upstream ModemManager for 5G modems"
+  fi
+
+  # QModem ships its own ndisc6 / rdisc6 / traceroute6 / rdnssd under
+  # feeds/qmodem/application/ndisc6/Makefile (PKG_NAME:=ndisc6). The upstream
+  # mt7987_mt7992.config ships the same package at
+  # package/mtk/applications/5g-modem/ndisc/ as a core repository package.
+  # When both are present the OpenWrt Kconfig parser emits a
+  # "recursive dependency detected!" error in tmp/.config-package.in because
+  # PACKAGE_ndisc6 appears twice (one source-Makefile in package/feeds/qmodem,
+  # one in package/mtk/applications/5g-modem/ndisc). The build still produces
+  # a working .config but the Kconfig error pollutes CI logs.
+  #
+  # QModem's ndisc6 Makefile is functionally identical (same PKG_VERSION
+  # 1.0.2, same upstream tarball remlab.net/files/ndisc6) and is the one we
+  # want when ENABLE_QMODEM=true (so qmodem core's DEPENDS resolves cleanly
+  # to a single provider). When ENABLE_QMODEM=false, we still drop the
+  # upstream mt798x duplicate to avoid the Kconfig error; the OpenWrt
+  # feeds/packages net/ipv6/ndisc6 path is the canonical provider in that
+  # case (it lives at feeds/packages/net/ndisc6 in immortalwrt-24.10 and
+  # produces PACKAGE_ndisc6 only once). We drop only the mt798x fork to
+  # eliminate the duplicate; feeds/packages net/ipv6/ndisc6 takes over.
+  if [ -d "package/mtk/applications/5g-modem/ndisc" ]; then
+    log "Removing duplicate ndisc6 provider at package/mtk/applications/5g-modem/ndisc"
+    rm -rf package/mtk/applications/5g-modem/ndisc
   fi
 
   if is_true "$ENABLE_ADGUARDHOME"; then
@@ -1111,6 +1276,26 @@ export MIHOMO_TCP_KEEPALIVE="1"\
     feed_install_pkg luci-app-adblock
   fi
 
+  if is_true "$ENABLE_QMODEM"; then
+    # QModem packages live at feeds/qmodem/<package>/ (top-level package
+    # directory layout). feed_install_pkg wires them into
+    # package/feeds/qmodem/ via ./scripts/feeds install -f so make defconfig
+    # can resolve CONFIG_PACKAGE_luci-app-qmodem-*. Default to *-next.
+    feed_install_pkg qmodem
+    feed_install_pkg ubus-at-daemon
+    feed_install_pkg tom_modem
+    feed_install_pkg sms-tool_q
+    feed_install_pkg modem_scan
+    feed_install_pkg quectel-CM-5G-M || true
+    if is_true "$ENABLE_QMODEM_NEXT"; then
+      feed_install_pkg luci-app-qmodem-next || log "WARNING: luci-app-qmodem-next not available in feed (upstream renamed?)"
+      feed_install_pkg sms-forwarder-next || true
+    fi
+    if is_true "$ENABLE_QMODEM_LUA"; then
+      feed_install_pkg luci-app-qmodem || true
+    fi
+  fi
+
   if is_true "$ENABLE_MOSDNS"; then
     require_package_file "MosDNS LuCI" "package/mosdns/luci-app-mosdns/Makefile"
     require_package_file "MosDNS core" "package/mosdns/mosdns/Makefile"
@@ -1171,11 +1356,29 @@ enable_upnp_stack_config() {
 }
 
 # Enable the full adblock stack (DNS-based ad/abuse domain blocking).
-# adblock upstream package DEPENDS are: +jshn +jsonfilter +coreutils +coreutils-sort
-#   +gawk +ca-bundle +rpcd +rpcd-mod-rpcsys
-# luci-app-adblock is a thin LuCI frontend (LUCI_DEPENDS: +luci-base +adblock).
-# We additionally ensure luci-i18n-adblock-zh-cn is selectable and that the
-# blocklist refresh tools (curl/wget) are present.
+#
+# adblock 4.4.x runtime model (see feeds/packages/net/adblock/files/adblock.sh):
+#   - f_load()    : adb_packages="$(ubus call rpc-sys packagelist ...)"; if this
+#                   ubus call fails, adb_packages is empty and every subsequent
+#                   auto-detection in f_dns/f_fetch fails.
+#   - f_dns()     : walks dns_list="knot-resolver bind-server unbound-daemon
+#                   smartdns dnsmasq-full dnsmasq-dhcpv6 dnsmasq" looking for
+#                   hits in adb_packages; needs dnsmasq-full/unbound/smartdns.
+#   - f_fetch()   : walks fetch_list="curl wget-ssl libustream-openssl
+#                   libustream-wolfssl libustream-mbedtls"; needs wget-ssl or
+#                   uclient-fetch (backed by libustream-mbedtls).
+#
+# Critical: `rpc-sys` ubus object is provided by rpcd-mod-rpcsys. Upstream
+# mt7987_mt7992.config explicitly disables it (`# CONFIG_PACKAGE_rpcd-mod-rpcsys
+# is not set`) and adblock's Makefile only soft-depends on it (+rpcd-mod-rpcsys,
+# no `select`). OpenWrt's make defconfig respects an explicit `# is not set`
+# over soft DEPENDS, so we MUST force CONFIG_PACKAGE_rpcd-mod-rpcsys=y here,
+# otherwise the compiled firmware ships without it and the runtime prints
+# "dns backend not found" + "download utility with SSL support not found".
+#
+# We also force the runtime transport + DNS backend packages that the script
+# auto-detects, so a future upstream base.config flip does not silently strip
+# them out of the image.
 enable_adblock_stack_config() {
   # adblock + LuCI UI + zh-cn translation
   config_enable PACKAGE_adblock
@@ -1191,10 +1394,230 @@ enable_adblock_stack_config() {
   config_enable PACKAGE_gawk
   config_enable PACKAGE_ca-bundle
   config_enable PACKAGE_rpcd
+  # CRITICAL: rpcd-mod-rpcsys provides `rpc-sys` ubus object used by adblock
+  # to enumerate installed packages. Without it adblock's f_dns/f_fetch
+  # auto-detection always fails.
   config_enable PACKAGE_rpcd-mod-rpcsys
-  # Blocklist refresh transport (HTTPS)
+  # DNS backend selection: f_dns looks for these names in adb_packages.
+  # dnsmasq-full is the upstream mt7987_mt7992.config default; we declare
+  # it explicitly so a future base.config change cannot silently drop it.
+  config_enable PACKAGE_dnsmasq-full
+  config_enable PACKAGE_dnsmasq_full_dhcp
+  config_enable PACKAGE_dnsmasq_full_dhcpv6
+  config_enable PACKAGE_dnsmasq_full_nftset
+  config_enable PACKAGE_dnsmasq_full_conntrack
+  # SSL download transport: f_fetch accepts curl/wget-ssl/uclient-fetch.
+  # uclient-fetch needs libustream-* (OpenSSL/wolfSSL/mbedTLS).
+  config_enable PACKAGE_wget-ssl
+  config_enable PACKAGE_uclient-fetch
+  config_enable PACKAGE_libustream-mbedtls
+  # Blocklist refresh transport (HTTPS) — curl as fallback
   config_enable PACKAGE_curl
   config_enable PACKAGE_ca-certificates
+}
+
+# Enable the modem stack (original luci-app-modem and/or QModem).
+#
+# The original luci-app-modem (Siriling 1.4.5) has a comprehensive LUCI_DEPENDS
+# that is auto-promoted to DEPENDS by feeds/luci/luci.mk, so the generic
+# USB/PCIe QMI modules (kmod-usb-net-qmi-wwan, kmod-usb-serial-option,
+# kmod-pcie_mhi, kmod-usb-net-cdc-mbim, quectel-CM-5G, sms-tool, ...) are
+# pulled in automatically. However:
+#   1. Quectel 5G modules (RG501Q-EU / RM5xxQ series) need vendor-specific
+#      QMI drivers. There are two sources:
+#        - feeds/packages/kernel/{quectel-qmi-wwan,fibocom-qmi-wwan}  → CONFIG_PACKAGE_kmod-usb-net-qmi-wwan-{quectel,fibocom}
+#        - FUjr/QModem driver/{quectel,fibocom,meig}_QMI_WWAN         → CONFIG_PACKAGE_kmod-qmi_wwan_{q,f,m}
+#      Both expose the SAME kernel module name (qmi_wwan_q.ko, qmi_wwan_f.ko);
+#      loading both at boot causes a duplicate-module panic, so we must
+#      pick exactly one source per stack and stick to it.
+#   2. The PCI modem path needs kmod-mhi-wwan-{ctrl,mbim} which the upstream
+#      mt7987_mt7992.config explicitly disables.
+#   3. For QModem-based deployment (FUjr/QModem), the package needs
+#      modemmanager + modemmanager-rpcd + luci-proto-modemmanager which are
+#      all `# is not set` in the upstream base.config, plus dbus + glib2.
+# This function forces all of those =y regardless of upstream base.config
+# defaults, and verifies post-defconfig that the critical kernel modules
+# actually survived dependency resolution.
+enable_modem_stack_config() {
+  # Generic USB/PCIe QMI / serial infrastructure. Covered by LUCI_DEPENDS
+  # for luci-app-modem, but we force =y so a base.config flip does not
+  # silently drop them when QModem is selected (which has no LUCI_DEPENDS).
+  config_enable PACKAGE_kmod-usb-core
+  config_enable PACKAGE_kmod-usb-ehci
+  config_enable PACKAGE_kmod-usb-xhci-hcd
+  config_enable PACKAGE_kmod-usb-xhci-mtk
+  config_enable PACKAGE_kmod-usb2
+  config_enable PACKAGE_kmod-usb3
+  config_enable PACKAGE_kmod-usb-ohci
+  config_enable PACKAGE_kmod-usb-net
+  config_enable PACKAGE_kmod-usb-net-qmi-wwan
+  config_enable PACKAGE_kmod-usb-net-cdc-ether
+  config_enable PACKAGE_kmod-usb-net-cdc-mbim
+  config_enable PACKAGE_kmod-usb-net-cdc-ncm
+  config_enable PACKAGE_kmod-usb-net-rndis
+  config_enable PACKAGE_kmod-usb-wdm
+  config_enable PACKAGE_kmod-usb-serial
+  config_enable PACKAGE_kmod-usb-serial-option
+  config_enable PACKAGE_kmod-usb-serial-qualcomm
+  config_enable PACKAGE_kmod-usb-serial-wwan
+  config_enable PACKAGE_kmod-usb-sierrawireless
+  config_enable PACKAGE_kmod-usb-acm
+  config_enable PACKAGE_kmod-pcie_mhi
+  config_enable PACKAGE_kmod-ppp-synctty
+  # USB Mass Storage (needed for firmware update sticks / external storage)
+  config_enable PACKAGE_kmod-usb-storage
+  config_enable PACKAGE_kmod-usb-storage-extras
+  config_enable PACKAGE_kmod-usb-storage-uas
+  config_enable PACKAGE_kmod-nls-base
+  config_enable PACKAGE_kmod-nls-cp437
+  config_enable PACKAGE_kmod-nls-iso8859-1
+  config_enable PACKAGE_kmod-nls-utf8
+  # Network stack
+  config_enable PACKAGE_kmod-mii
+  config_enable PACKAGE_kmod-libphy
+  config_enable PACKAGE_kmod-phylink
+  config_enable PACKAGE_kmod-macvlan
+  config_enable PACKAGE_kmod-ppp
+  config_enable PACKAGE_kmod-pppoe
+  config_enable PACKAGE_kmod-pppox
+  config_enable PACKAGE_kmod-slhc
+  config_enable PACKAGE_kmod-mppe
+  # Generic netfilter / nftables building blocks for fw4 + QModem
+  config_enable PACKAGE_kmod-nf-conntrack
+  config_enable PACKAGE_kmod-nf-conntrack6
+  config_enable PACKAGE_kmod-nf-conntrack-netlink
+  config_enable PACKAGE_kmod-nf-flow
+  config_enable PACKAGE_kmod-nf-ipt
+  config_enable PACKAGE_kmod-nf-nat
+  config_enable PACKAGE_kmod-nf-nathelper
+  config_enable PACKAGE_kmod-nf-nathelper-extra
+  config_enable PACKAGE_kmod-nf-log
+  config_enable PACKAGE_kmod-nf-log6
+  config_enable PACKAGE_kmod-nf-reject
+  config_enable PACKAGE_kmod-nf-reject6
+  config_enable PACKAGE_kmod-nfnetlink
+  config_enable PACKAGE_kmod-nft-core
+  config_enable PACKAGE_kmod-nft-compat
+  config_enable PACKAGE_kmod-nft-fib
+  config_enable PACKAGE_kmod-nft-nat
+  config_enable PACKAGE_kmod-nft-offload
+  config_enable PACKAGE_kmod-ipt-core
+  config_enable PACKAGE_kmod-ebtables
+  # WiFi cfg80211 + kernel crypto (needed for WPA3/Saikai crypto)
+  config_enable PACKAGE_kmod-cfg80211
+  config_enable PACKAGE_kmod-crypto-aead
+  config_enable PACKAGE_kmod-crypto-hash
+  config_enable PACKAGE_kmod-crypto-hmac
+  config_enable PACKAGE_kmod-crypto-sha256
+  config_enable PACKAGE_kmod-crypto-sha512
+  config_enable PACKAGE_kmod-crypto-sha1
+  config_enable PACKAGE_kmod-crypto-md5
+  config_enable PACKAGE_kmod-crypto-sha3
+  config_enable PACKAGE_kmod-crypto-des
+  config_enable PACKAGE_kmod-crypto-ecb
+  config_enable PACKAGE_kmod-crypto-null
+  config_enable PACKAGE_kmod-crypto-arc4
+  config_enable PACKAGE_kmod-crypto-manager
+  config_enable PACKAGE_kmod-crypto-user
+  config_enable PACKAGE_kmod-crypto-rng
+  config_enable PACKAGE_kmod-crypto-authenc
+  config_enable PACKAGE_kmod-crypto-crc32c
+  # Filesystem modules for USB / SD storage
+  config_enable PACKAGE_kmod-fs-exfat
+  config_enable PACKAGE_kmod-fs-ext4
+  config_enable PACKAGE_kmod-fs-vfat
+  config_enable PACKAGE_kmod-fs-ntfs3
+  # Misc kernel infrastructure
+  config_enable PACKAGE_kmod-gpio-button-hotplug
+  config_enable PACKAGE_kmod-leds-gpio
+  config_enable PACKAGE_kmod-hwmon-core
+  config_enable PACKAGE_kmod-i2c-core
+  config_enable PACKAGE_kmod-lib-crc16
+  config_enable PACKAGE_kmod-lib-crc32c
+  config_enable PACKAGE_kmod-lib-crc-ccitt
+  config_enable PACKAGE_kmod-lib-textsearch
+  config_enable PACKAGE_kmod-sched-core
+  config_enable PACKAGE_kmod-scsi-core
+  config_enable PACKAGE_kmod-asn1-decoder
+  config_enable PACKAGE_kmod-ifb
+  # TCP BBR (goodputs Nikki / MosDNS / HomeProxy)
+  config_enable PACKAGE_kmod-tcp-bbr
+  # ---- Original luci-app-modem (Siriling) — only when not running QModem ----
+  if is_true "$ENABLE_ORIGINAL_MODEM"; then
+    config_enable PACKAGE_luci-app-modem
+    config_enable PACKAGE_luci-i18n-modem-zh-cn
+    # Generic Quectel/Fibocom QMI drivers from immortalwrt feeds (these
+    # conflict with QModem's vendor drivers, hence the mutual exclusion
+    # enforced in resolve_modem_stack()).
+    config_enable PACKAGE_kmod-usb-net-qmi-wwan-quectel
+    config_enable PACKAGE_kmod-usb-net-qmi-wwan-fibocom
+    # Dialer + tools used by luci-app-modem
+    config_enable PACKAGE_quectel-CM-5G
+    config_enable PACKAGE_sms-tool
+    config_enable PACKAGE_bc
+    config_enable PACKAGE_jq
+    config_enable PACKAGE_ndisc6
+    config_enable PACKAGE_rdisc6
+    config_enable PACKAGE_usbutils
+    config_enable PACKAGE_pciutils
+    config_enable PACKAGE_pciids
+  fi
+  # ---- QModem (FUjr) — only when not running the original modem ----
+  if is_true "$ENABLE_QMODEM"; then
+    # Pick exactly one frontend. ENABLE_QMODEM_NEXT wins by default;
+    # ENABLE_QMODEM_LUA can be opted in if a user needs the classic Lua UI.
+    if is_true "$ENABLE_QMODEM_NEXT"; then
+      config_enable PACKAGE_luci-app-qmodem-next
+      config_enable PACKAGE_luci-i18n-qmodem-next-zh-cn
+    fi
+    if is_true "$ENABLE_QMODEM_LUA"; then
+      config_enable PACKAGE_luci-app-qmodem
+      config_enable PACKAGE_luci-i18n-qmodem-zh-cn
+    fi
+    # Core QModem package (always required regardless of which UI).
+    config_enable PACKAGE_qmodem
+    # QModem ships vendor-specific QMI drivers under driver/ that match
+    # kmod-qmi_wwan_{q,f,s}. Use ONLY QModem's drivers when QModem is on
+    # (resolve_modem_stack guarantees the original-modem path is off, so
+    # the immortalwrt feeds quectel-qmi-wwan / fibocom-qmi-wwan packages
+    # are NOT selected here; selecting both would duplicate qmi_wwan_q.ko).
+    config_enable PACKAGE_kmod-qmi_wwan_q
+    config_enable PACKAGE_kmod-qmi_wwan_f
+    config_enable PACKAGE_kmod-qmi_wwan_s
+    # qmodem 核心包硬依赖（来自 feeds/qmodem/application/qmodem/Makefile）
+    config_enable PACKAGE_ubus-at-daemon
+    config_enable PACKAGE_tom_modem
+    config_enable PACKAGE_sms-tool_q
+    config_enable PACKAGE_modem_scan
+    config_enable PACKAGE_terminfo
+    config_enable PACKAGE_xxd
+    config_enable PACKAGE_coreutils-stat
+    # luci-app-qmodem-next 额外依赖 sms-forwarder-next
+    config_enable PACKAGE_sms-forwarder-next
+    # luci-app-qmodem (Lua) / luci-app-qmodem-next (JS) 通用运行时依赖
+    config_enable PACKAGE_luci-compat
+    # luci-app-qmodem (Lua) IPv6 ND 工具 (Makefile 中有 ndisc6 / rdisc6 选项)
+    if is_true "$ENABLE_QMODEM_LUA"; then
+      config_enable PACKAGE_ndisc6
+    fi
+    # ModemManager + libqmi + libmbim are required by QModem's mbim/qmi
+    # helpers. dbus + glib2 are hard ModemManager build dependencies.
+    config_enable PACKAGE_dbus
+    config_enable PACKAGE_libdbus
+    config_enable PACKAGE_glib2
+    config_enable PACKAGE_jansson
+    config_enable PACKAGE_libqmi
+    config_enable PACKAGE_libmbim
+    config_enable PACKAGE_qmi-utils
+    config_enable PACKAGE_modemmanager
+    config_enable PACKAGE_modemmanager-rpcd
+    config_enable PACKAGE_luci-proto-modemmanager
+    # uqmi is the legacy userspace QMI tool used by QModem's netifd procd
+    # helper scripts even when ModemManager is the primary controller.
+    config_enable PACKAGE_uqmi
+    # QModem 推荐：Tom 定制版拨号工具 quectel-CM-5G-M（包含在 QModem 仓库）
+    config_enable PACKAGE_quectel-CM-5G-M
+  fi
 }
 
 enable_h5000m_wifi_driver_config() {
@@ -1638,17 +2061,20 @@ EOF
     disabled_pkgs+=("luci-app-dockerman" "luci-i18n-dockerman-zh-cn" "luci-lib-docker")
   fi
 
-  if is_true "$ENABLE_ORIGINAL_MODEM"; then
-    echo "CONFIG_PACKAGE_luci-app-modem=y" >> .config
-    echo "CONFIG_PACKAGE_luci-i18n-modem-zh-cn=y" >> .config
-    # luci-app-modem lives at immortalwrt-mt798x/package/mtk/applications/5g-modem/
-    # (Siriling's port; supports USB + PCIe 5G modems incl. Quectel RG500Q-EA/RG520N-EU
-    # and most RM5xxQ series). Its LUCI_DEPENDS already covers every kernel module
-    # and tool the UI invokes (kmod-usb-net-qmi-wwan, kmod-pcie_mhi, quectel-CM-5G,
-    # sms-tool, ndisc6, jq, bc, etc.), so we only need to flip the luci-app itself.
-    # luci-i18n-modem-zh-cn is auto-generated from the package's po/zh-cn/ tree.
-  else
+  # Modem stack — mutually exclusive Original vs QModem (resolved in
+  # resolve_modem_stack). enable_modem_stack_config declares the kernel
+  # modules + userspace tools + LUCI panel for whichever path is active.
+  if is_true "$ENABLE_ORIGINAL_MODEM" || is_true "$ENABLE_QMODEM"; then
+    enable_modem_stack_config
+  fi
+  if ! is_true "$ENABLE_ORIGINAL_MODEM"; then
     disabled_pkgs+=("luci-app-modem" "luci-i18n-modem-zh-cn" "luci-i18n-modem-en")
+    # When QModem is on, also disable the immortalwrt feeds QMI vendor
+    # drivers that conflict with QModem's driver/{quectel,fibocom}_QMI_WWAN.
+    disabled_pkgs+=("quectel-qmi-wwan" "fibocom-qmi-wwan")
+  fi
+  if ! is_true "$ENABLE_QMODEM"; then
+    disabled_pkgs+=("luci-app-qmodem" "luci-i18n-qmodem-zh-cn" "luci-app-qmodem-next" "luci-i18n-qmodem-next-zh-cn" "qmodem" "ubus-at-daemon" "tom_modem" "sms-tool_q" "modem_scan" "quectel-CM-5G-M" "sms-forwarder-next")
   fi
 
   local all_disabled=("luci-app-wrtbwmon" "luci-app-rclone" "rclone" "rclone-ng" "rclone-webui-react" "${disabled_pkgs[@]}")
@@ -1738,6 +2164,36 @@ EOF
   verify_enabled_pkg "DockerMan zh-cn" "luci-i18n-dockerman-zh-cn" "$ENABLE_DOCKERMAN"
   verify_enabled_pkg "Original Modem" "luci-app-modem" "$ENABLE_ORIGINAL_MODEM"
   verify_enabled_pkg "Original Modem zh-cn" "luci-i18n-modem-zh-cn" "$ENABLE_ORIGINAL_MODEM"
+  # Modem kernel module verification — these MUST survive defconfig
+  # because adblock/luci-app-modem/QModem all assume the QMI/PCIe/MHI
+  # stack is present. Without them, Quectel RG501Q-EU cannot enumerate.
+  if is_true "$ENABLE_ORIGINAL_MODEM" || is_true "$ENABLE_QMODEM"; then
+    verify_enabled_pkg "Modem QMI WWAN" "kmod-usb-net-qmi-wwan" true
+    verify_enabled_pkg "Modem USB serial option" "kmod-usb-serial-option" true
+    verify_enabled_pkg "Modem PCIe MHI" "kmod-pcie_mhi" true
+    if is_true "$ENABLE_ORIGINAL_MODEM"; then
+      verify_enabled_pkg "Original Modem Quectel driver" "kmod-usb-net-qmi-wwan-quectel" true
+      verify_enabled_pkg "Original Modem Fibocom driver" "kmod-usb-net-qmi-wwan-fibocom" true
+      verify_enabled_pkg "Modem quectel dial" "quectel-CM-5G" true
+    fi
+    if is_true "$ENABLE_QMODEM"; then
+      verify_enabled_pkg "QModem Quectel driver" "kmod-qmi_wwan_q" true
+      verify_enabled_pkg "QModem Fibocom driver" "kmod-qmi_wwan_f" true
+      verify_enabled_pkg "QModem ModemManager" "modemmanager" true
+      verify_enabled_pkg "QModem dbus" "dbus" true
+    fi
+  fi
+  # QModem (FUjr) verification — frontend depends on ENABLE_QMODEM_NEXT vs LUA
+  verify_enabled_pkg "QModem core" "qmodem" "$ENABLE_QMODEM"
+  if is_true "$ENABLE_QMODEM_NEXT"; then
+    verify_enabled_pkg "QModem-Next LuCI" "luci-app-qmodem-next" true
+    verify_enabled_pkg "QModem-Next zh-cn" "luci-i18n-qmodem-next-zh-cn" true
+    verify_enabled_pkg "QModem-Next sms-forwarder-next" "sms-forwarder-next" true
+  fi
+  if is_true "$ENABLE_QMODEM_LUA"; then
+    verify_enabled_pkg "QModem-Lua LuCI" "luci-app-qmodem" true
+    verify_enabled_pkg "QModem-Lua zh-cn" "luci-i18n-qmodem-zh-cn" true
+  fi
   verify_enabled_pkg "HomeProxy" "luci-app-homeproxy" "$ENABLE_HOMEPROXY"
   verify_enabled_pkg "HomeProxy zh-cn" "luci-i18n-homeproxy-zh-cn" "$ENABLE_HOMEPROXY"
   verify_enabled_pkg "HomeProxy sing-box" "sing-box" "$ENABLE_HOMEPROXY"
@@ -1745,6 +2201,13 @@ EOF
   verify_enabled_pkg "Adblock" "adblock" "$ENABLE_ADBLOCK"
   verify_enabled_pkg "Adblock LuCI" "luci-app-adblock" "$ENABLE_ADBLOCK"
   verify_enabled_pkg "Adblock zh-cn" "luci-i18n-adblock-zh-cn" "$ENABLE_ADBLOCK"
+  # Adblock runtime stack verification — without these, f_dns/f_fetch cannot
+  # auto-detect the DNS backend or SSL download tool and the runtime prints
+  # "dns backend not found" / "download utility with SSL support not found".
+  verify_enabled_pkg "Adblock rpcd-mod-rpcsys" "rpcd-mod-rpcsys" "$ENABLE_ADBLOCK"
+  verify_enabled_pkg "Adblock dnsmasq-full" "dnsmasq-full" "$ENABLE_ADBLOCK"
+  verify_enabled_pkg "Adblock wget-ssl" "wget-ssl" "$ENABLE_ADBLOCK"
+  verify_enabled_pkg "Adblock uclient-fetch" "uclient-fetch" "$ENABLE_ADBLOCK"
   # MWAN3 removed; no verify checks (see ENABLE_MWAN3=false default).
   verify_enabled_pkg "MT WiFi zh-cn" "luci-i18n-mtwifi-cfg-zh-cn" true
   # Network acceleration (turboacc-mtk) and fan control (Airpifanctrl) are
@@ -1972,6 +2435,12 @@ collect_artifacts() {
   if is_true "$ENABLE_HOMEPROXY" && ! grep -q '^luci-app-homeproxy[[:space:]-]' "$ARTIFACTS_DIR/openwrt-image.manifest"; then
     die "Firmware image manifest is missing required package: luci-app-homeproxy"
   fi
+  if is_true "$ENABLE_QMODEM" && is_true "$ENABLE_QMODEM_NEXT" && ! grep -q '^luci-app-qmodem-next[[:space:]-]' "$ARTIFACTS_DIR/openwrt-image.manifest"; then
+    die "Firmware image manifest is missing required package: luci-app-qmodem-next"
+  fi
+  if is_true "$ENABLE_QMODEM" && is_true "$ENABLE_QMODEM_LUA" && ! grep -q '^luci-app-qmodem[[:space:]-]' "$ARTIFACTS_DIR/openwrt-image.manifest"; then
+    die "Firmware image manifest is missing required package: luci-app-qmodem"
+  fi
 
   {
     echo "ImmortalWrt H5000M local build"
@@ -1994,6 +2463,7 @@ main() {
   cd "$ROOT_DIR"
   is_true "$INSTALL_DEPS" && install_deps
   check_environment
+  resolve_modem_stack
   show_features
   prepare_source
   prepare_feeds

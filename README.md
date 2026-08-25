@@ -67,7 +67,7 @@ $env:ENABLE_ADBLOCK = 'true'
 .\scripts\local-build.ps1
 ```
 
-全兼容插件本地编译示例（同时启用上游原版 Modem + Adblock，关闭 MosDNS 释放编译时间）：
+全兼容插件本地编译示例（同时启用 QModem + Adblock + HomeProxy + 原版 Modem + AdGuardHome + OpenClash + MosDNS + Nikki + UPnP + VLMCSd + DockerMan）：
 
 ```powershell
 $env:ENABLE_ADGUARDHOME = 'true'
@@ -77,11 +77,27 @@ $env:ENABLE_UPNP = 'true'
 $env:ENABLE_VLMCSD = 'true'
 $env:ENABLE_MOSDNS = 'true'
 $env:ENABLE_DOCKERMAN = 'true'
-$env:ENABLE_QMODEM_NEXT = 'true'
-$env:ENABLE_QMODEM = 'false'
+$env:ENABLE_QMODEM = 'true'
 $env:ENABLE_HOMEPROXY = 'true'
-$env:ENABLE_ADBYBY_PLUS = 'true'
+$env:ENABLE_ORIGINAL_MODEM = 'true'
+$env:ENABLE_ADBLOCK = 'true'
+.\scripts\local-build.ps1
+
+# 关闭原版 Modem 仅保留 QModem（适合仅使用 Quectel RG501Q-EU 的场景）：
 $env:ENABLE_ORIGINAL_MODEM = 'false'
+$env:ENABLE_QMODEM = 'true'
+$env:ENABLE_QMODEM_NEXT = 'true'
+$env:ENABLE_QMODEM_LUA = 'false'
+.\scripts\local-build.ps1
+
+# 切换 QModem 到经典 Lua 版：
+$env:ENABLE_QMODEM_NEXT = 'false'
+$env:ENABLE_QMODEM_LUA = 'true'
+.\scripts\local-build.ps1
+
+# 关闭 QModem 只用原版 modem：
+$env:ENABLE_ORIGINAL_MODEM = 'true'
+$env:ENABLE_QMODEM = 'false'
 .\scripts\local-build.ps1
 ```
 
@@ -145,7 +161,10 @@ FULL_BUILD_PROFILE=proxy-stack PROFILE_SET=quick bash scripts/coverage-test.sh
 | `ENABLE_OPENCLASH` | `false` | OpenClash |
 | `ENABLE_DOCKERMAN` | `false` | DockerMan + dockerd |
 | `ENABLE_HOMEPROXY` | `false` | HomeProxy |
-| `ENABLE_ORIGINAL_MODEM` | `true` | 上游原版 modem（luci-app-modem + ModemManager，支持 Quectel RG501Q-EU/RM5xxQ 等 QMI 5G 模块） |
+| `ENABLE_ORIGINAL_MODEM` | `false` | 上游原版 modem（luci-app-modem + ModemManager，支持 Quectel RG501Q-EU/RM5xxQ 等 QMI 5G 模块）。与 QModem **互斥**——同时启用会被自动关闭 |
+| `ENABLE_QMODEM` | `true` | QModem（FUjr/QModem，Quectel/Fibocom/MEIG/SIMCOM 5G modem LuCI 面板，原版 luci-app-modem 不覆盖 RG501Q-EU 等专用 5G 驱动时启用）。与原版 modem **互斥** |
+| `ENABLE_QMODEM_NEXT` | `true` | QModem 新版 JS LuCI (`luci-app-qmodem-next`)。与 `ENABLE_QMODEM_LUA` 互斥——默认启用新版 |
+| `ENABLE_QMODEM_LUA` | `false` | QModem 经典 Lua LuCI (`luci-app-qmodem`)。与 `ENABLE_QMODEM_NEXT` 互斥 |
 | `ENABLE_ADBLOCK` | `true` | Adblock（DNS 层广告/恶意域名过滤，依赖 dnsmasq/unbound/smartdns） |
 
 ### 下载优化变量
@@ -246,7 +265,9 @@ Actions → Run workflow → `runner_type` 选 `self-hosted`（默认 `linux,x64
 
 UPnP 修复：`luci-app-upnp` 依赖虚拟包 `miniupnpd`，fw4 构建中显式选择 `miniupnpd-nftables` 与 `rpcd-mod-ucode`，避免 `defconfig` 将 `luci-app-upnp` 自动关闭。若上游源码引用 `libcrypt-compat` 但当前 feeds 未定义该包，构建脚本会补一个 glibc 条件下的兼容包定义，避免包扫描阶段刷屏 warning。
 
-原版 Modem（默认）：`ENABLE_ORIGINAL_MODEM=true` 启用上游 `luci-app-modem` + `modem` + `luci-i18n-modem-zh-cn`，底层走 `modemmanager` + `libqmi`，支持 Quectel RG501Q-EU/RM5xxQ 系列等所有 QMI 5G 模块（包括 USB/PCIe 双形态）。MTK `package/mtk/applications/5g-modem/quectel_QMI_WWAN` 等内核驱动模块已存在于 immortalwrt 源中，由 package-metadata 自动解析，无需额外 `src-git qmodem` feed。原先引入的 `FUjr/QModem` 私有源、其 `kmod-mhi-wwan-ctrl/mbim` 等不存在的 dep 补丁、以及 `patch_qmodem_*` 系列特殊修复全部移除。
+原版 Modem（默认关闭）：`ENABLE_ORIGINAL_MODEM=false`（默认）。需设 `ENABLE_ORIGINAL_MODEM=true ENABLE_QMODEM=false` 启用。启用上游 `luci-app-modem` + `modem` + `luci-i18n-modem-zh-cn`，底层走 `modemmanager` + `libqmi` + immortalwrt feeds 的 `quectel-qmi-wwan` / `fibocom-qmi-wwan`（`kmod-usb-net-qmi-wwan-{quectel,fibocom}`），支持 Quectel RG501Q-EU/RM5xxQ 系列等所有 QMI 5G 模块（USB/PCIe 双形态）。MTK `package/mtk/applications/5g-modem/quectel_QMI_WWAN` 等内核驱动模块已存在于 immortalwrt 源中，由 package-metadata 自动解析。**注意：与 QModem 互斥**——同时启用两者，`resolve_modem_stack()` 会自动关闭原版。`enable_modem_stack_config()` 在原版 modem 路径下还会强制启用通用 USB/PCIe/netfilter/crypto/filesystem kmod 全集（kmod-usb-core/ehci/xhci/storage、kmod-nf-*、kmod-crypto-*、kmod-fs-{exfat,ext4,vfat,ntfs3} 等）。
+
+QModem（默认）：`ENABLE_QMODEM=true`（默认与原版 modem **互斥**——同时启用会被自动关闭原版）启用 `FUjr/QModem` 的 `qmodem` + `qmodem-modemband` + LuCI 前端（默认 `luci-app-qmodem-next`，即新版纯 JS LuCI；可选 `luci-app-qmodem` 经典 Lua 版），覆盖 Quectel RG501Q-EU / RM5xxQ、Fibocom FM350、MEIG SLM320、SIMCom SIM8200 等 5G 模块（USB qmi/gobinet/ecm/mbim/rndis/ncm + PCIe qmi/gobinet/mbim）。`enable_modem_stack_config()` 显式启用 QModem 自带的 `kmod-qmi_wwan_q|f`（Quectel/Fibocom 专用 QMI 驱动，**与** immortalwrt feeds 的 `kmod-usb-net-qmi-wwan-{quectel,fibocom}` 互斥——同一 qmi_wwan_q.ko 不能加载两次）、`modemmanager` + `modemmanager-rpcd` + `luci-proto-modemmanager` + `dbus` + `glib2` + `libqmi` + `libmbim` + `qmi-utils` + `uqmi`，以及通用 USB/PCIe/netfilter/crypto/filesystem kmod 全集。**只启用 QModem、不启用原版** 即可支持 RG501Q-EU；只启用原版 modem（`ENABLE_ORIGINAL_MODEM=true ENABLE_QMODEM=false`）则使用 immortalwrt feeds 的 Quectel/Fibocom 驱动。`coverage-test.sh` 提供 `qmodem` 与 `qmodem-lua` 两个 profile 分别验证。
 
 Adblock（默认）：`ENABLE_ADBLOCK=true` 启用上游 `adblock` + `luci-app-adblock` + `luci-i18n-adblock-zh-cn`，再加 `enable_adblock_stack_config()` 显式声明全部运行时依赖（`jshn` / `jsonfilter` / `coreutils` / `coreutils-sort` / `gawk` / `ca-bundle` / `rpcd` / `rpcd-mod-rpcsys` / `curl` / `ca-certificates`），作为 defconfig 鲁棒性网。原先 `adbyby-plus` Lite 的 `kongfl888` 私有源克隆、`ADBYBY_PLUS_I18N_IPK_URL` 预编译 ipk 下载、`luci-app-adbyby-plus` + `ipset` 注入等全部移除。
 

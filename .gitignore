@@ -3,6 +3,9 @@ immortalwrt/
 immortalwrt-coverage/
 artifacts-coverage/
 
+# OpenWrt feeds clones (本地 SKIP_FEEDS_UPDATE=true 模式生成)
+feeds/
+
 # 编译产物
 artifacts/
 artifacts.tar.gz

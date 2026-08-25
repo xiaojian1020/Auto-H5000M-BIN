@@ -7,6 +7,13 @@ SOURCE_DIR_ROOT="${SOURCE_DIR_ROOT:-immortalwrt-coverage}"
 ARTIFACTS_DIR_ROOT="${ARTIFACTS_DIR_ROOT:-artifacts-coverage}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 2)}"
 FULL_BUILD_PROFILE="${FULL_BUILD_PROFILE:-}"
+# COVERAGE_PARALLEL: when set to true, run profiles in parallel. Default
+# is sequential because each profile mutates the shared SOURCE_DIR_ROOT
+# (OpenWrt buildroot scans package/, mutates feeds.tmp/.packageinfo, and
+# races on .git/index.lock). Sequential execution is slower but
+# correct; flip the env var when network/CPU resources make the serial
+# wall-clock unacceptable.
+COVERAGE_PARALLEL="${COVERAGE_PARALLEL:-false}"
 
 usage() {
   cat <<'EOF'
@@ -44,8 +51,11 @@ base_env=(
   ENABLE_MOSDNS=true
   ENABLE_DOCKERMAN=false
   ENABLE_HOMEPROXY=false
-  ENABLE_ORIGINAL_MODEM=true
+  ENABLE_ORIGINAL_MODEM=false
   ENABLE_ADBLOCK=true
+  ENABLE_QMODEM=true
+  ENABLE_QMODEM_NEXT=true
+  ENABLE_QMODEM_LUA=false
 )
 
 run_static_checks() {
@@ -76,6 +86,7 @@ run_profile() {
       SOURCE_DIR="$source_dir" \
       ARTIFACTS_DIR="$artifacts_dir" \
       THREADS="$THREADS" \
+      SKIP_FEEDS_UPDATE=true \
       "${base_env[@]}" \
       "$@" \
       bash scripts/local-build.sh "${args[@]}"
@@ -112,7 +123,15 @@ run_named_profile() {
       ;;
     original-modem)
       run_profile original-modem "$mode" \
-        ENABLE_NIKKI=false ENABLE_MOSDNS=false ENABLE_ORIGINAL_MODEM=true
+        ENABLE_NIKKI=false ENABLE_MOSDNS=false ENABLE_ORIGINAL_MODEM=true ENABLE_QMODEM=false ENABLE_QMODEM_NEXT=false ENABLE_QMODEM_LUA=false
+      ;;
+    qmodem)
+      run_profile qmodem "$mode" \
+        ENABLE_NIKKI=false ENABLE_MOSDNS=false ENABLE_ORIGINAL_MODEM=false ENABLE_QMODEM=true ENABLE_QMODEM_NEXT=true ENABLE_QMODEM_LUA=false
+      ;;
+    qmodem-lua)
+      run_profile qmodem-lua "$mode" \
+        ENABLE_NIKKI=false ENABLE_MOSDNS=false ENABLE_ORIGINAL_MODEM=false ENABLE_QMODEM=true ENABLE_QMODEM_NEXT=false ENABLE_QMODEM_LUA=true
       ;;
     adblock)
       run_profile adblock "$mode" \
@@ -144,7 +163,7 @@ profiles_for_set() {
       printf '%s\n' default proxy-stack
       ;;
     full)
-      printf '%s\n' default minimal proxy-stack homeproxy-only mosdns-only nikki-only original-modem adblock optional-services all-compatible dockerman
+      printf '%s\n' default minimal proxy-stack homeproxy-only mosdns-only nikki-only original-modem qmodem qmodem-lua adblock optional-services all-compatible dockerman
       ;;
     *)
       echo "Unknown PROFILE_SET: $PROFILE_SET" >&2
@@ -157,22 +176,36 @@ run_profiles_parallel() {
   local mode="$1"
   shift
   local profiles=("$@")
-  local pids=() failed=0
+  local failed=0
 
-  for profile in "${profiles[@]}"; do
-    [ -n "$profile" ] || continue
-    (
-      run_named_profile "$profile" "$mode"
-    ) &
-    pids+=($!)
-  done
+  if is_true "${COVERAGE_PARALLEL:-false}"; then
+    local pids=()
+    for profile in "${profiles[@]}"; do
+      [ -n "$profile" ] || continue
+      (
+        run_named_profile "$profile" "$mode"
+      ) &
+      pids+=($!)
+    done
 
-  for i in "${!pids[@]}"; do
-    wait "${pids[$i]}" || {
-      echo "Profile '${profiles[$i]}' FAILED" >&2
-      failed=1
-    }
-  done
+    for i in "${!pids[@]}"; do
+      wait "${pids[$i]}" || {
+        echo "Profile '${profiles[$i]}' FAILED" >&2
+        failed=1
+      }
+    done
+  else
+    # Sequential: each profile fully reuses SOURCE_DIR_ROOT in turn.
+    # This avoids .git/index.lock races, feeds.tmp/.packageinfo
+    # clobbering, and parallel-config overlapping across profiles.
+    for profile in "${profiles[@]}"; do
+      [ -n "$profile" ] || continue
+      if ! run_named_profile "$profile" "$mode"; then
+        echo "Profile '$profile' FAILED" >&2
+        failed=1
+      fi
+    done
+  fi
 
   return "$failed"
 }
@@ -185,7 +218,7 @@ main() {
     [ -n "$profile" ] && profiles+=("$profile")
   done < <(profiles_for_set)
 
-  log "Running ${#profiles[@]} profiles in parallel..."
+    log "Running ${#profiles[@]} profiles (parallel=${COVERAGE_PARALLEL})..."
   if ! run_profiles_parallel config "${profiles[@]}"; then
     die "One or more coverage profiles failed"
   fi
